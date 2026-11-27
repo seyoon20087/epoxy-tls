@@ -147,6 +147,31 @@ fn is_ip_literal(host: &str) -> bool {
 fn normalize_host(host: &str) -> String {
 	host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
+/// The address whose class decides whether a connection is allowed. IPv6 forms that carry an
+/// IPv4 address get checked as that IPv4 address:
+/// - `::ffff:a.b.c.d` (IPv4-mapped)
+/// - `64:ff9b::a.b.c.d` (well-known NAT64 prefix, so `64:ff9b::a00:5` can't reach `10.0.0.5`
+///   through a NAT64 gateway)
+/// - `::a.b.c.d` (deprecated IPv4-compatible; `::` and `::1` stay as they are)
+///
+/// The original address is still the one connected to.
+fn filter_addr(addr: IpAddr) -> IpAddr {
+	let IpAddr::V6(v6) = addr.to_canonical() else {
+		return addr.to_canonical();
+	};
+	let seg = v6.segments();
+	let embedded = Ipv4Addr::from(u32::from_be_bytes(
+		v6.octets()[12..16].try_into().expect("slice is 4 bytes"),
+	));
+	match seg {
+		[0x64, 0xff9b, 0, 0, 0, 0, _, _] => IpAddr::V4(embedded),
+		[0, 0, 0, 0, 0, 0, _, _] if !v6.is_unspecified() && !v6.is_loopback() => {
+			IpAddr::V4(embedded)
+		}
+		_ => IpAddr::V6(v6),
+	}
+}
+
 fn is_global(addr: IpAddr) -> bool {
 	match addr {
 		IpAddr::V4(x) => ipv4_is_global(x),
@@ -248,19 +273,21 @@ impl ClientStream {
 			.context("failed to resolve hostname")?
 			.filter(|x| CONFIG.server.resolve_ipv6 || x.is_ipv4())
 			.map(|addr| {
-				// check (and connect to) `::ffff:a.b.c.d` as plain IPv4 so it gets the IPv4 rules
+				// connect to `::ffff:a.b.c.d` as plain IPv4
 				let addr = addr.to_canonical();
+				// check addresses with an embedded IPv4 address against the IPv4 rules
+				let checked = filter_addr(addr);
 
-				if is_local_host(addr) && !CONFIG.stream.allow_loopback {
+				if is_local_host(checked) && !CONFIG.stream.allow_loopback {
 					return ResolvedPacket::Blocked;
 				}
 
-				if addr.is_multicast() && !CONFIG.stream.allow_multicast {
+				if checked.is_multicast() && !CONFIG.stream.allow_multicast {
 					return ResolvedPacket::Blocked;
 				}
 
-				if (is_global(addr) && !CONFIG.stream.allow_global)
-					|| (!is_global(addr) && !CONFIG.stream.allow_non_global)
+				if (is_global(checked) && !CONFIG.stream.allow_global)
+					|| (!is_global(checked) && !CONFIG.stream.allow_non_global)
 				{
 					return ResolvedPacket::Blocked;
 				}
@@ -412,6 +439,23 @@ mod tests {
 		// mapped addresses get the IPv4 rules once canonicalized
 		assert!(!is_global(canon("::ffff:192.168.1.1")));
 		assert!(is_global(canon("::ffff:1.1.1.1")));
+	}
+
+	#[test]
+	fn embedded_ipv4_is_checked_as_ipv4() {
+		let f = |s: &str| filter_addr(IpAddr::from_str(s).unwrap());
+		assert_eq!(f("64:ff9b::a00:5"), canon("10.0.0.5"));
+		assert_eq!(f("64:ff9b::7f00:1"), canon("127.0.0.1"));
+		assert_eq!(f("::7f00:1"), canon("127.0.0.1"));
+		assert_eq!(f("::ffff:192.168.1.1"), canon("192.168.1.1"));
+		assert!(is_local_host(f("64:ff9b::7f00:1")));
+		assert!(!is_global(f("64:ff9b::a9fe:a9fe")));
+		assert!(is_global(f("64:ff9b::101:101")));
+		// unchanged
+		assert_eq!(f("::"), canon("::"));
+		assert_eq!(f("::1"), canon("::1"));
+		assert_eq!(f("2606:4700::1111"), canon("2606:4700::1111"));
+		assert_eq!(f("1.1.1.1"), canon("1.1.1.1"));
 	}
 
 	#[test]

@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use serde::Serialize;
+use tokio::{sync::Mutex, time::Instant};
 use wisp_mux::packet::{ConnectPacket, StreamType};
 
 use crate::{CLIENTS, CONFIG};
@@ -59,7 +60,29 @@ struct ServerStats {
 	memory: MemoryStats,
 }
 
+/// How long a generated stats report is reused.
+const STATS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Last report and when it was made. A tokio mutex so concurrent requests wait for one
+/// generation instead of each taking the global `CLIENTS` lock.
+static STATS_CACHE: Mutex<Option<(Instant, String)>> = Mutex::const_new(None);
+
+/// Stats report, regenerated at most once per [`STATS_CACHE_TTL`]. Building it holds the global
+/// `CLIENTS` lock (which every connection setup and teardown needs) for time proportional to the
+/// number of clients and streams, so unauthenticated requests mustn't trigger it every time.
 pub async fn generate_stats() -> anyhow::Result<String> {
+	let mut cache = STATS_CACHE.lock().await;
+	if let Some((at, stats)) = &*cache {
+		if at.elapsed() < STATS_CACHE_TTL {
+			return Ok(stats.clone());
+		}
+	}
+	let stats = generate_stats_uncached().await?;
+	*cache = Some((Instant::now(), stats.clone()));
+	Ok(stats)
+}
+
+async fn generate_stats_uncached() -> anyhow::Result<String> {
 	use tikv_jemalloc_ctl::stats::{active, allocated, mapped, metadata, resident, retained};
 	tikv_jemalloc_ctl::epoch::advance()?;
 

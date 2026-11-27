@@ -19,6 +19,11 @@ use wisp_mux::{
 
 use crate::{handle::wisp::utils::get_certificates_from_paths, CLI, CONFIG, RESOLVER};
 
+/// Parsed `certificate_extension_keys`. The config is immutable after startup, so one load is
+/// enough.
+static CERT_AUTH_KEYS: tokio::sync::OnceCell<Vec<wisp_mux::extensions::cert::VerifyKey>> =
+	tokio::sync::OnceCell::const_new();
+
 pub const VERSION_STRING: &str = concat!(
 	"git ",
 	env!("VERGEN_GIT_SHA"),
@@ -460,8 +465,16 @@ impl WispConfig {
 				Some(ProtocolExtensionAuth::Certificate) => {
 					extensions.push(AnyProtocolExtensionBuilder::new(
 						CertAuthProtocolExtensionBuilder::new_server(
-							get_certificates_from_paths(self.certificate_extension_keys.clone())
-								.await?,
+							// read from disk once (at startup, via `validate_config_cache`), not
+							// on every connection before the client has authenticated
+							CERT_AUTH_KEYS
+								.get_or_try_init(|| {
+									get_certificates_from_paths(
+										self.certificate_extension_keys.clone(),
+									)
+								})
+								.await?
+								.clone(),
 							self.certificate_extension_required,
 						),
 					));
