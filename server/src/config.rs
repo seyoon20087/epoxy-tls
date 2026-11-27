@@ -109,16 +109,30 @@ pub struct ServerConfig {
 	pub file_raw_mode: bool,
 	/// Keypair (public, private) in PEM format for TLS.
 	pub tls_keypair: Option<[PathBuf; 2]>,
+	/// File mode applied to unix sockets after binding (e.g. `0o660` in TOML). By default the
+	/// socket gets the process umask, which often makes it connectable by every local user.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub unix_socket_permissions: Option<u32>,
 
-	/// Where to listen for stats requests over HTTP.
+	/// Where to listen for stats requests over HTTP. Stats are unauthenticated and list every
+	/// connected client's address and destinations, so prefer a separate private bind address
+	/// over a path on the public listener (or set `stats_hide_clients`).
 	pub stats_endpoint: Option<StatsEndpoint>,
+	/// Leave per-client details (addresses, destinations) out of stats; only a count is shown.
+	pub stats_hide_clients: bool,
 
 	/// Whether or not to search for the x-real-ip or x-forwarded-for headers.
 	pub use_real_ip_headers: bool,
 	/// String sent to a request that is not a websocket upgrade request.
 	pub non_ws_response: String,
+	/// If non-empty, browser WebSocket upgrades whose `Origin` header is not in this list are
+	/// rejected. Set this when the server is reachable from a user's browser (localhost or an
+	/// intranet) so arbitrary websites can't use it as a proxy. Requests without an `Origin`
+	/// header (non-browser clients) are always allowed.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub allowed_origins: Vec<String>,
 
-	/// Max WebSocket message size that can be recieved.
+	/// Max WebSocket message (or length-delimited frame) size that can be recieved.
 	pub max_message_size: usize,
 
 	/// Server log level.
@@ -147,9 +161,25 @@ pub enum ProtocolExtensionAuth {
 	Certificate,
 }
 
+/// Never write real passwords out (serialized config is served by the stats endpoint).
+#[doc(hidden)]
+fn serialize_redacted_passwords<S: serde::Serializer>(
+	users: &HashMap<String, String>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	use serde::ser::SerializeMap;
+	let mut map = serializer.serialize_map(Some(users.len()))?;
+	for user in users.keys() {
+		map.serialize_entry(user, "<redacted>")?;
+	}
+	map.end()
+}
+
 #[doc(hidden)]
 fn default_motd() -> String {
-	format!("epoxy_server ({VERSION_STRING})")
+	// no version/commit here: the MOTD goes to every client before authentication, and an exact
+	// build string helps attackers match known bugs. Set `motd_extension` to advertise one.
+	"epoxy_server".to_string()
 }
 
 #[doc(hidden)]
@@ -181,7 +211,10 @@ pub struct WispConfig {
 	/// Write limit in bytes/second for all streams in a wisp connection.
 	pub write_limit: f64,
 
-	#[serde(skip_serializing_if = "HashMap::is_empty")]
+	#[serde(
+		skip_serializing_if = "HashMap::is_empty",
+		serialize_with = "serialize_redacted_passwords"
+	)]
 	/// Wisp version 2 password authentication extension username/passwords.
 	pub password_extension_users: HashMap<String, String>,
 	pub password_extension_required: bool,
@@ -245,6 +278,13 @@ pub struct StreamConfig {
 	pub allow_ports: Vec<Vec<u16>>,
 	/// Range blacklist of ports. Format is `[lower_bound, upper_bound]`.
 	pub block_ports: Vec<Vec<u16>>,
+
+	/// Max streams one client connection may have open at once (0 = unlimited). Streams over
+	/// the limit are closed with `ServerStreamThrottled`.
+	pub max_streams_per_client: usize,
+	/// Max upstream streams/connections across all clients (0 = unlimited). Set this below the
+	/// process file descriptor limit so clients can't exhaust it.
+	pub max_outbound_connections: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -338,11 +378,14 @@ impl Default for ServerConfig {
 			tcp_nodelay: true,
 			file_raw_mode: false,
 			tls_keypair: None,
+			unix_socket_permissions: None,
 
 			stats_endpoint: None,
+			stats_hide_clients: false,
 
 			use_real_ip_headers: false,
 			non_ws_response: ":3".to_string(),
+			allowed_origins: Vec::new(),
 
 			max_message_size: 64 * 1024,
 
@@ -471,6 +514,9 @@ impl Default for StreamConfig {
 
 			allow_ports: Vec::new(),
 			block_ports: Vec::new(),
+
+			max_streams_per_client: 256,
+			max_outbound_connections: 0,
 		}
 	}
 }

@@ -271,6 +271,9 @@ impl ProtocolExtensionBuilder for CertAuthProtocolExtensionBuilder {
 				..
 			} => {
 				// validate and parse response
+				if bytes.remaining() < 1 + 32 {
+					return Err(WispError::PacketTooSmall);
+				}
 				let cert_type = SupportedCertificateTypes::from_bits(bytes.get_u8())
 					.ok_or(WispError::CertAuthExtensionSigInvalid)?;
 				let hash = bytes.split_to(32);
@@ -287,6 +290,9 @@ impl ProtocolExtensionBuilder for CertAuthProtocolExtensionBuilder {
 				}
 			}
 			Self::ClientBeforeChallenge { signer } => {
+				if bytes.remaining() < 2 {
+					return Err(WispError::PacketTooSmall);
+				}
 				let required = bytes.get_u8() != 0;
 				// sign challenge
 				let cert_types = SupportedCertificateTypes::from_bits(bytes.get_u8())
@@ -368,6 +374,29 @@ impl ProtocolExtensionBuilder for CertAuthProtocolExtensionBuilder {
 			Self::ClientBeforeChallenge { .. } | Self::ServerAfterChallenge { .. } => {
 				Err(WispError::ExtensionImplNotSupported)
 			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use bytes::Bytes;
+
+	use super::*;
+
+	#[test]
+	fn short_input_is_an_error_not_a_panic() {
+		for len in [0usize, 1, 32] {
+			let mut server = CertAuthProtocolExtensionBuilder::new_server(Vec::new(), true);
+			// move the server into the after-challenge state
+			server.build_to_extension(Role::Server).unwrap();
+			let res = server.build_from_bytes(Bytes::from(vec![1u8; len]), Role::Server);
+			assert!(matches!(res, Err(WispError::PacketTooSmall)), "len {len}");
+		}
+		for len in [0usize, 1] {
+			let res = CertAuthProtocolExtensionBuilder::new_client(None)
+				.build_from_bytes(Bytes::from(vec![1u8; len]), Role::Client);
+			assert!(matches!(res, Err(WispError::PacketTooSmall)), "len {len}");
 		}
 	}
 }

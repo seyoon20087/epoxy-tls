@@ -81,6 +81,16 @@ impl ProtocolExtension for PasswordProtocolExtension {
 	}
 }
 
+/// Compare without short-circuiting on the first differing byte, so response timing doesn't
+/// reveal how much of a guessed password was right. (The length still leaks, which is fine.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+	std::hint::black_box(diff) == 0
+}
+
 /// Password protocol extension builder.
 ///
 /// **Passwords are sent in plain text!!**
@@ -182,12 +192,20 @@ impl ProtocolExtensionBuilder for PasswordProtocolExtensionBuilder {
 	) -> Result<AnyProtocolExtension, WispError> {
 		match self {
 			Self::ServerBeforeClientInfo { users, required } => {
+				if bytes.remaining() < 1 {
+					return Err(WispError::PacketTooSmall);
+				}
 				let user_len = bytes.get_u8();
+				if bytes.remaining() < user_len as usize {
+					return Err(WispError::PacketTooSmall);
+				}
 
 				let user = std::str::from_utf8(&bytes.split_to(user_len as usize))?.to_string();
 				let password = std::str::from_utf8(&bytes)?.to_string();
 
-				let valid = users.get(&user).is_some_and(|x| *x == password);
+				let valid = users
+					.get(&user)
+					.is_some_and(|x| constant_time_eq(x.as_bytes(), password.as_bytes()));
 
 				*self = Self::ServerAfterClientInfo {
 					users: users.clone(),
@@ -205,6 +223,9 @@ impl ProtocolExtensionBuilder for PasswordProtocolExtensionBuilder {
 				}
 			}
 			Self::ClientBeforeServerInfo { creds } => {
+				if bytes.remaining() < 1 {
+					return Err(WispError::PacketTooSmall);
+				}
 				let required = bytes.get_u8() != 0;
 
 				*self = Self::ClientAfterServerInfo {
@@ -218,5 +239,40 @@ impl ProtocolExtensionBuilder for PasswordProtocolExtensionBuilder {
 				Err(WispError::ExtensionImplNotSupported)
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use bytes::Bytes;
+
+	use super::*;
+
+	fn server() -> PasswordProtocolExtensionBuilder {
+		PasswordProtocolExtensionBuilder::new_server(
+			HashMap::from([("user".to_string(), "pass".to_string())]),
+			true,
+		)
+	}
+
+	#[test]
+	fn short_client_info_is_an_error_not_a_panic() {
+		for bytes in [&b""[..], &[0xFF][..], &[5, b'a'][..]] {
+			let res = server().build_from_bytes(Bytes::copy_from_slice(bytes), Role::Server);
+			assert!(matches!(res, Err(WispError::PacketTooSmall)), "{bytes:?}");
+		}
+		let res = PasswordProtocolExtensionBuilder::new_client(None)
+			.build_from_bytes(Bytes::new(), Role::Client);
+		assert!(matches!(res, Err(WispError::PacketTooSmall)));
+	}
+
+	#[test]
+	fn valid_and_invalid_creds() {
+		let ok = server().build_from_bytes(Bytes::from_static(b"\x04userpass"), Role::Server);
+		assert!(ok.is_ok());
+		let bad = server().build_from_bytes(Bytes::from_static(b"\x04userwrong"), Role::Server);
+		assert!(matches!(bad, Err(WispError::PasswordExtensionCredsInvalid)));
 	}
 }

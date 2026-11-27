@@ -61,6 +61,12 @@ pub async fn handle_wsproxy(
 
 	let requested_stream = connect.clone();
 
+	// one stream per connection, so only the global limit matters here
+	let Some(_permits) = crate::limits::try_acquire(None) else {
+		let _ = ws.close(CloseCode::SERVICE_OVERLOAD, "server busy").await;
+		return Ok(());
+	};
+
 	let Ok(resolved) = ClientStream::resolve(connect).await else {
 		let _ = ws
 			.close(CloseCode::INTERNAL_SERVER_ERROR, "failed to resolve host")
@@ -122,6 +128,10 @@ pub async fn handle_wsproxy(
 
 	let uuid = Uuid::new_v4();
 
+	// wsproxy is one stream per connection, but still subject to the configured bandwidth limits
+	#[cfg(feature = "speed-limit")]
+	let (read_limit, write_limit) = crate::handle::wisp::new_limiters();
+
 	debug!(
 		"new wsproxy client id {:?} connected: (stream uuid {:?}) {:?} {:?}",
 		id, uuid, requested_stream, resolved_stream
@@ -144,6 +154,8 @@ pub async fn handle_wsproxy(
 						x = ws.read() => {
 							match x.transpose()? {
 								Some(WebSocketFrame::Data(data)) => {
+									#[cfg(feature = "speed-limit")]
+									write_limit.consume(data.len()).await;
 									stream.write_all(&data).await?;
 								}
 								Some(WebSocketFrame::Close) => {
@@ -159,6 +171,8 @@ pub async fn handle_wsproxy(
 							if len == 0 {
 								break Ok(());
 							}
+							#[cfg(feature = "speed-limit")]
+							read_limit.consume(len).await;
 							ws.write(x.to_vec()).await?;
 							stream.consume(len);
 						}
@@ -183,6 +197,8 @@ pub async fn handle_wsproxy(
 						x = ws.read() => {
 							match x.transpose()? {
 								Some(WebSocketFrame::Data(data)) => {
+									#[cfg(feature = "speed-limit")]
+									write_limit.consume(data.len()).await;
 									stream.send(&data).await?;
 								}
 								Some(WebSocketFrame::Close | WebSocketFrame::Ignore) => {}
@@ -190,7 +206,10 @@ pub async fn handle_wsproxy(
 							}
 						}
 						size = stream.recv(&mut data) => {
-							ws.write(data[..size?].to_vec()).await?;
+							let size = size?;
+							#[cfg(feature = "speed-limit")]
+							read_limit.consume(size).await;
+							ws.write(data[..size].to_vec()).await?;
 						}
 					}
 				}
@@ -226,6 +245,8 @@ pub async fn handle_wsproxy(
 						x = ws.read() => {
 							match x.transpose()? {
 								Some(WebSocketFrame::Data(data)) => {
+									#[cfg(feature = "speed-limit")]
+									write_limit.consume(data.len()).await;
 									stream.send(data.into()).await?;
 								}
 								Some(WebSocketFrame::Close) => {
@@ -239,7 +260,10 @@ pub async fn handle_wsproxy(
 							let Some(x) = x else {
 								break;
 							};
-							ws.write(x?).await?;
+							let x = x?;
+							#[cfg(feature = "speed-limit")]
+							read_limit.consume(x.len()).await;
+							ws.write(x).await?;
 						}
 					}
 				}

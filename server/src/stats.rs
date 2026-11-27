@@ -11,7 +11,9 @@ fn format_stream_type(stream_type: StreamType) -> &'static str {
 		StreamType::Udp => "udp",
 		#[cfg(feature = "twisp")]
 		StreamType::Other(crate::handle::wisp::twisp::STREAM_TYPE) => "twisp",
-		StreamType::Other(_) => unreachable!(),
+		// reachable: wispnet routing forwards any stream type, and a panic here aborts the
+		// whole server (panic = "abort") the next time stats are generated
+		StreamType::Other(_) => "other",
 	}
 }
 
@@ -51,7 +53,9 @@ struct ClientStats {
 #[derive(Serialize)]
 struct ServerStats {
 	config: String,
-	clients: HashMap<String, ClientStats>,
+	client_count: usize,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	clients: Option<HashMap<String, ClientStats>>,
 	memory: MemoryStats,
 }
 
@@ -69,9 +73,13 @@ pub async fn generate_stats() -> anyhow::Result<String> {
 	};
 
 	let clients_locked = CLIENTS.lock().await;
+	let client_count = clients_locked.len();
 
 	let mut clients = HashMap::with_capacity(clients_locked.len());
-	for client in clients_locked.iter() {
+	for client in clients_locked
+		.iter()
+		.filter(|_| !CONFIG.server.stats_hide_clients)
+	{
 		clients.insert(
 			client.0.to_string(),
 			ClientStats {
@@ -92,7 +100,8 @@ pub async fn generate_stats() -> anyhow::Result<String> {
 
 	let stats = ServerStats {
 		config: CONFIG.ser()?,
-		clients,
+		client_count,
+		clients: (!CONFIG.server.stats_hide_clients).then_some(clients),
 		memory,
 	};
 

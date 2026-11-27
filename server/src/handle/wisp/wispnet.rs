@@ -1,6 +1,7 @@
 use std::{
 	collections::HashMap,
-	sync::atomic::{AtomicU32, Ordering},
+	sync::Arc,
+	time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -9,7 +10,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use log::debug;
-use tokio::{select, sync::Mutex};
+use tokio::{select, sync::Mutex, time::timeout};
 use uuid::Uuid;
 use wisp_mux::{
 	extensions::{
@@ -28,14 +29,13 @@ use crate::{
 };
 
 struct WispnetClient {
-	mux: ClientMux<WispStreamWrite>,
+	mux: Arc<ClientMux<WispStreamWrite>>,
 	id: String,
 	private: bool,
 }
 
 lazy_static! {
 	static ref WISPNET_SERVERS: Mutex<HashMap<u32, WispnetClient>> = Mutex::new(HashMap::new());
-	static ref WISPNET_IDS: AtomicU32 = AtomicU32::new(0);
 }
 
 // payload:
@@ -142,17 +142,30 @@ impl ProtocolExtension for WispnetServerProtocolExtension {
 	}
 }
 
+/// How long a wispnet peer gets to accept a new stream.
+const WISPNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn route_wispnet(server: u32, packet: ConnectPacket) -> Result<ClientStream> {
-	if let Some(server) = WISPNET_SERVERS.lock().await.get(&server) {
-		let stream = server
-			.mux
-			.new_stream(packet.stream_type, packet.host, packet.port)
-			.await
-			.context("failed to connect to wispnet server")?;
-		Ok(ClientStream::Wispnet(stream, server.id.clone()))
-	} else {
-		Ok(ClientStream::NoResolvedAddrs)
-	}
+	// Copy what we need out and release the global lock *before* talking to the peer. A peer
+	// that stops reading would otherwise leave `new_stream` pending with the lock held, freezing
+	// wispnet routing, registration and cleanup for everyone.
+	let Some((mux, id)) = WISPNET_SERVERS
+		.lock()
+		.await
+		.get(&server)
+		.map(|x| (x.mux.clone(), x.id.clone()))
+	else {
+		return Ok(ClientStream::NoResolvedAddrs);
+	};
+
+	let stream = timeout(
+		WISPNET_CONNECT_TIMEOUT,
+		mux.new_stream(packet.stream_type, packet.host, packet.port),
+	)
+	.await
+	.context("wispnet server timed out")?
+	.context("failed to connect to wispnet server")?;
+	Ok(ClientStream::Wispnet(stream, id))
 }
 
 async fn copy_wisp(
@@ -211,20 +224,37 @@ pub async fn handle_stream(
 	}
 }
 
+async fn new_wispnet_id() -> u32 {
+	let servers = WISPNET_SERVERS.lock().await;
+	loop {
+		#[expect(clippy::cast_possible_truncation)]
+		let id = Uuid::new_v4().as_u128() as u32;
+		if !servers.contains_key(&id) {
+			return id;
+		}
+	}
+}
+
 pub async fn handle_wispnet(stream: WispResult, id: String) -> Result<()> {
 	let (read, write) = stream;
-	let net_id = WISPNET_IDS.fetch_add(1, Ordering::SeqCst);
+	// Random rather than sequential: "private" servers are only hidden from the listing, so a
+	// counter would let anyone reach them by trying 0, 1, 2, ... The protocol caps ids at u32.
+	let net_id = new_wispnet_id().await;
 
 	let extensions = vec![WispnetServerProtocolExtensionBuilder(net_id).into()];
 
-	let (mux, fut) = Box::pin(
-		ClientMux::new(read, write, Some(WispV2Handshake::new(extensions)))
-			.await
-			.context("failed to create client multiplexor")?
-			.with_required_extensions(&[WispnetServerProtocolExtension::ID]),
-	)
+	let (mux, fut) = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, async {
+		Box::pin(
+			ClientMux::new(read, write, Some(WispV2Handshake::new(extensions)))
+				.await
+				.context("failed to create client multiplexor")?
+				.with_required_extensions(&[WispnetServerProtocolExtension::ID]),
+		)
+		.await
+		.context("wispnet client did not have wispnet extension")
+	})
 	.await
-	.context("wispnet client did not have wispnet extension")?;
+	.context("wispnet handshake timed out")??;
 
 	let is_private = mux
 		.get_extensions()
@@ -232,14 +262,22 @@ pub async fn handle_wispnet(stream: WispResult, id: String) -> Result<()> {
 		.context("failed to find wispnet extension")?
 		.1;
 
-	WISPNET_SERVERS.lock().await.insert(
+	let mut servers = WISPNET_SERVERS.lock().await;
+	if servers.contains_key(&net_id) {
+		// another peer registered the same random id during our handshake
+		drop(servers);
+		let _ = mux.close().await;
+		anyhow::bail!("wispnet id collision");
+	}
+	servers.insert(
 		net_id,
 		WispnetClient {
-			mux,
+			mux: Arc::new(mux),
 			id: id.clone(),
 			private: is_private,
 		},
 	);
+	drop(servers);
 
 	// probably the only time someone would do this
 	let ret = fut.await;

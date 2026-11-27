@@ -38,7 +38,15 @@ pub(crate) type StreamMap = FxHashMap<u32, StreamMapValue>;
 pub(crate) struct StreamMapValue {
 	pub info: Arc<StreamInfo>,
 	pub stream: flume::Sender<Payload>,
+	/// Close the stream (instead of dropping data) when its queue is full. Only ever set with
+	/// the `bounded-stream-queues` feature.
+	pub close_on_full: bool,
 }
+
+/// Queue length (in messages) for streams that have no Wisp flow control, with the
+/// `bounded-stream-queues` feature.
+#[cfg_attr(not(feature = "bounded-stream-queues"), allow(dead_code))]
+const UNFLOWED_STREAM_QUEUE_LIMIT: usize = 256;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum FlowControl {
@@ -257,7 +265,7 @@ impl<R: TransportRead, W: TransportWrite, M: MultiplexorActor<W>> MuxInner<R, W,
 		} = self.start.take().ok_or(WispError::MuxTaskStarted)?;
 
 		if let Some(packet) = downgrade {
-			if self.handle_packet(packet)? {
+			if self.handle_packet(packet).await? {
 				return Ok(());
 			}
 		}
@@ -339,7 +347,7 @@ impl<R: TransportRead, W: TransportWrite, M: MultiplexorActor<W>> MuxInner<R, W,
 					break;
 				}
 				WsEvent::WispMessage(packet) => {
-					let should_break = self.handle_packet(packet)?;
+					let should_break = self.handle_packet(packet).await?;
 					if should_break {
 						break;
 					}
@@ -363,14 +371,22 @@ impl<R: TransportRead, W: TransportWrite, M: MultiplexorActor<W>> MuxInner<R, W,
 		let flow = M::get_flow_control(ty, &self.flow_stream_types);
 		let (data_tx, data_rx) = if flow == FlowControl::EnabledSendMessages {
 			flume::bounded(self.buffer_size as usize)
+		} else if cfg!(feature = "bounded-stream-queues") {
+			flume::bounded(UNFLOWED_STREAM_QUEUE_LIMIT)
 		} else {
 			flume::unbounded()
 		};
+		// Dropping data would silently corrupt a reliable stream, so a ClientMux TCP stream is
+		// closed instead. UDP (FlowControl::Disabled) just drops, and server-side flow-controlled
+		// streams keep dropping on overflow as before (the client broke flow control).
+		let close_on_full = cfg!(feature = "bounded-stream-queues")
+			&& flow == FlowControl::EnabledTrackAmount;
 
 		let info = Arc::new(StreamInfo::new(id, flow, self.buffer_size));
 		let val = StreamMapValue {
 			info: info.clone(),
 			stream: data_tx,
+			close_on_full,
 		};
 		self.streams.insert(id, val);
 
@@ -382,7 +398,7 @@ impl<R: TransportRead, W: TransportWrite, M: MultiplexorActor<W>> MuxInner<R, W,
 		stream.info.set_reason(close.reason);
 	}
 
-	fn handle_packet(&mut self, packet: Packet<'static>) -> Result<bool, WispError> {
+	async fn handle_packet(&mut self, packet: Packet<'static>) -> Result<bool, WispError> {
 		use PacketType as P;
 		match packet.packet_type {
 			P::Connect(connect) => {
@@ -392,6 +408,36 @@ impl<R: TransportRead, W: TransportWrite, M: MultiplexorActor<W>> MuxInner<R, W,
 			}
 
 			P::Data(data) => {
+				// only this task sends into the queue, so `is_full` can't race another sender
+				if let Some(stream) = self
+					.streams
+					.get(&packet.stream_id)
+					.filter(|x| x.close_on_full && x.stream.is_full())
+				{
+					let id = stream.info.id;
+					if let Some(stream) = self.streams.remove(&id) {
+						let close = ClosePacket {
+							reason: CloseReason::ClientUnexpected,
+						};
+						Self::close_stream(stream, close);
+						self.tx.lock().await;
+						let ret = self
+							.tx
+							.get()
+							.send(
+								Packet {
+									stream_id: id,
+									packet_type: PacketType::Close(close),
+								}
+								.encode(),
+							)
+							.await;
+						self.tx.unlock();
+						ret?;
+					}
+					return Ok(false);
+				}
+
 				self.mux.handle_data_packet(
 					packet.stream_id,
 					data.into_owned(),

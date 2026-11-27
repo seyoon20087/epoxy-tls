@@ -26,11 +26,31 @@ use wisp_mux::{
 };
 use wispnet::route_wispnet;
 
+/// How long a client gets to finish the Wisp handshake (including authentication).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 use crate::{
 	route::{WispResult, WispStreamWrite, WispWsStreamWrite},
+	limits,
 	stream::{ClientStream, ResolvedPacket},
 	CLIENTS, CONFIG,
 };
+
+#[cfg(feature = "speed-limit")]
+pub type Limiter = async_speed_limit::Limiter<async_speed_limit::clock::StandardClock>;
+
+/// Per-connection (read, write) limiters from `wisp.read_limit` / `wisp.write_limit`. "Read" is
+/// upstream -> client, "write" is client -> upstream, matching `copy_fast`.
+#[cfg(feature = "speed-limit")]
+pub fn new_limiters() -> (Limiter, Limiter) {
+	let build = |limit| {
+		async_speed_limit::Limiter::builder(limit)
+			.refill(Duration::from_secs(1))
+			.clock(async_speed_limit::clock::StandardClock)
+			.build()
+	};
+	(build(CONFIG.wisp.read_limit), build(CONFIG.wisp.write_limit))
+}
 
 async fn copy_fast(
 	mux: MuxStream<WispStreamWrite>,
@@ -154,25 +174,37 @@ async fn forward_stream(
 			let (mut read, write) = muxstream.into_split();
 			let mut write = write.into_async_write().compat_write();
 
-			let ret: anyhow::Result<()> = async move {
+			// The two directions run concurrently rather than as select! branch bodies: UDP
+			// streams have no flow control, so if client->upstream stopped being drained
+			// while a write to a slow (or deliberately non-reading) client was pending, the
+			// mux would keep buffering the client's packets without limit.
+			let stream = &stream;
+			let upstream = async {
+				while let Some(data) = read.next().await.transpose()? {
+					#[cfg(feature = "speed-limit")]
+					write_limit.consume(data.len()).await;
+					stream.send(&data).await?;
+				}
+				anyhow::Ok(())
+			};
+			let downstream = async {
 				let mut data = vec![0u8; 65507];
 				loop {
-					select! {
-						size = stream.recv(&mut data) => {
-							let size = size?;
-							write.write_all(&data[..size]).await?;
-						}
-						data = read.next() => {
-							if let Some(data) = data.transpose()? {
-								stream.send(&data).await?;
-							} else {
-								break Ok(());
-							}
-						}
+					let size = match stream.recv(&mut data).await {
+						Ok(size) => size,
+						Err(err) => break Err::<(), anyhow::Error>(err.into()),
+					};
+					#[cfg(feature = "speed-limit")]
+					read_limit.consume(size).await;
+					if let Err(err) = write.write_all(&data[..size]).await {
+						break Err(err.into());
 					}
 				}
-			}
-			.await;
+			};
+			let ret: anyhow::Result<()> = select! {
+				x = upstream => x,
+				x = downstream => x,
+			};
 
 			match ret {
 				Ok(()) => {
@@ -229,6 +261,7 @@ async fn forward_stream(
 async fn handle_stream(
 	connect: ConnectPacket,
 	muxstream: MuxStream<WispStreamWrite>,
+	_permits: limits::StreamPermits,
 	id: String,
 	event: Arc<Event>,
 	#[cfg(feature = "twisp")] twisp_map: twisp::TwispMap,
@@ -308,28 +341,27 @@ pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow:
 	}
 
 	#[cfg(feature = "speed-limit")]
-	let read_limiter = async_speed_limit::Limiter::builder(CONFIG.wisp.read_limit)
-		.refill(Duration::from_secs(1))
-		.clock(async_speed_limit::clock::StandardClock)
-		.build();
-	#[cfg(feature = "speed-limit")]
-	let write_limiter = async_speed_limit::Limiter::builder(CONFIG.wisp.write_limit)
-		.refill(Duration::from_secs(1))
-		.clock(async_speed_limit::clock::StandardClock)
-		.build();
+	let (read_limiter, write_limiter) = new_limiters();
 
-	let (mux, fut) = Box::pin(
-		Box::pin(ServerMux::new(
-			read,
-			write,
-			buffer_size,
-			if is_v2 { extensions } else { None },
-		))
-		.await
-		.context("failed to create server multiplexor")?
-		.with_required_extensions(&required_extensions),
-	)
-	.await?;
+	// a client that stalls mid-handshake would otherwise hold its connection open forever
+	let (mux, fut) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+		anyhow::Ok(
+			Box::pin(
+				Box::pin(ServerMux::new(
+					read,
+					write,
+					buffer_size,
+					if is_v2 { extensions } else { None },
+				))
+				.await
+				.context("failed to create server multiplexor")?
+				.with_required_extensions(&required_extensions),
+			)
+			.await?,
+		)
+	})
+	.await
+	.context("wisp handshake timed out")??;
 	let mux = Arc::new(mux);
 
 	debug!(
@@ -370,12 +402,24 @@ pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow:
 		}
 	});
 
+	let client_limit = limits::new_client_limit();
+
 	while let Some((connect, stream)) = mux.wait_for_stream().await {
 		// reap finished streams so long-lived clients don't grow memory forever
 		while set.try_join_next().is_some() {}
+
+		let Some(permits) = limits::try_acquire(client_limit.as_ref()) else {
+			debug!("[{id}] stream limit reached, rejecting {connect:?}");
+			set.spawn(async move {
+				let _ = stream.close(CloseReason::ServerStreamThrottled).await;
+			});
+			continue;
+		};
+
 		set.spawn(handle_stream(
 			connect,
 			stream,
+			permits,
 			id.clone(),
 			event.clone(),
 			#[cfg(feature = "twisp")]

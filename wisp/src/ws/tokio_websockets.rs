@@ -29,19 +29,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for TokioWebsocketsTransport<S> {
 		mut self: Pin<&mut Self>,
 		cx: &mut std::task::Context<'_>,
 	) -> Poll<Option<Self::Item>> {
-		match self.0.poll_next_unpin(cx) {
-			Poll::Ready(Some(Ok(x))) => {
-				if x.is_binary() {
-					Poll::Ready(Some(Ok(x.into_payload().into())))
-				} else if x.is_close() {
-					Poll::Ready(None)
-				} else {
-					self.poll_next(cx)
+		// loop instead of recursing on skipped frames: a burst of pings/text frames
+		// would otherwise grow the stack once per frame
+		loop {
+			match self.0.poll_next_unpin(cx) {
+				Poll::Ready(Some(Ok(x))) => {
+					if x.is_binary() {
+						return Poll::Ready(Some(Ok(x.into_payload().into())));
+					} else if x.is_close() {
+						return Poll::Ready(None);
+					}
 				}
+				Poll::Ready(Some(Err(x))) => return Poll::Ready(Some(Err(map_err(x)))),
+				Poll::Ready(None) => return Poll::Ready(None),
+				Poll::Pending => return Poll::Pending,
 			}
-			Poll::Ready(Some(Err(x))) => Poll::Ready(Some(Err(map_err(x)))),
-			Poll::Ready(None) => Poll::Ready(None),
-			Poll::Pending => Poll::Pending,
 		}
 	}
 }

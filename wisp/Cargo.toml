@@ -40,6 +40,11 @@ tokio-websockets = ["dep:tokio-websockets", "dep:tokio"]
 tokio-tungstenite = ["dep:tokio-tungstenite", "dep:tokio"]
 embedded-io-async = ["dep:embedded-io-async","embedded-io-async/std"]
 embedded-nal-async = ["dep:embedded-nal-async","embedded-io-async"]
+# Bound every stream's incoming queue instead of only flow-controlled ones. Meant for servers:
+# without it, streams with no Wisp flow control (UDP, and TCP streams of a ClientMux) buffer
+# whatever the other side sends without limit. With it, a full UDP queue drops datagrams and a
+# full ClientMux TCP queue closes that stream.
+bounded-stream-queues = []
 
 [dev-dependencies]
 tokio = { version = "1.42.0", features = ["macros", "rt", "time"] }

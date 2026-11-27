@@ -19,7 +19,11 @@ use wisp_mux::{
 	stream::MuxStream,
 };
 
-use crate::{route::WispStreamWrite, CONFIG, RESOLVER};
+use crate::{
+	route::WispStreamWrite,
+	ws_limit::{PingFlood, PingLimiter},
+	CONFIG, RESOLVER,
+};
 
 fn match_addr(str: &str, allowed: &RegexSet, blocked: &RegexSet) -> bool {
 	blocked.is_match(str) && !allowed.is_match(str)
@@ -101,9 +105,47 @@ fn ipv6_is_global(addr: Ipv6Addr) -> bool {
             || matches!(addr.segments(), [0x2002, _, _, _, _, _, _, _])
             || ((addr.segments()[0] == 0x2001) && (addr.segments()[1] == 0xdb8)) // || addr.is_documentation()
             || (addr.segments()[0] & 0xfe00) == 0xfc00 // addr.is_unique_local()
-            || (addr.segments()[0] & 0xfe00) == 0xfc00
-		// || addr.is_unicast_link_local()
+            || (addr.segments()[0] & 0xffc0) == 0xfe80 // addr.is_unicast_link_local()
 	)
+}
+
+/// Addresses that reach this machine: loopback, plus the unspecified address (`0.0.0.0` / `::`),
+/// which Linux treats as "connect to self".
+///
+/// Callers must pass a canonical address (see [`IpAddr::to_canonical`]) so IPv4-mapped IPv6
+/// forms like `::ffff:127.0.0.1` are caught too.
+fn is_local_host(addr: IpAddr) -> bool {
+	addr.is_loopback() || addr.is_unspecified()
+}
+
+/// Whether `host` is an IP address in any form a resolver might accept: plain, bracketed IPv6
+/// (`[::1]`), or the legacy `inet_aton` shorthands the system resolver understands
+/// (`2130706433`, `0x7f.1`, `127.1`). Expects a lowercased host.
+fn is_ip_literal(host: &str) -> bool {
+	if IpAddr::from_str(host).is_ok() {
+		return true;
+	}
+	if let Some(inner) = host.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+		if Ipv6Addr::from_str(inner).is_ok() {
+			return true;
+		}
+	}
+	let parts: Vec<&str> = host.split('.').collect();
+	parts.len() <= 4
+		&& parts.iter().all(|part| {
+			if let Some(hex) = part.strip_prefix("0x") {
+				!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+			} else {
+				!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+			}
+		})
+}
+
+/// Normalize a hostname before matching it against host regexes, so `EXAMPLE.com.` can't slip
+/// past a rule written for `example.com`. DNS names are case-insensitive and a trailing dot only
+/// marks the name as fully qualified.
+fn normalize_host(host: &str) -> String {
+	host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 fn is_global(addr: IpAddr) -> bool {
 	match addr {
@@ -151,6 +193,13 @@ impl ClientStream {
 			}
 		}
 
+		// after the wispnet and twisp branches: wispnet ids are case-sensitive base64 and a twisp
+		// "host" is a command line
+		let packet = ConnectPacket {
+			host: normalize_host(&packet.host),
+			..packet
+		};
+
 		if !CONFIG.stream.allow_udp && packet.stream_type == StreamType::Udp {
 			return Ok(ResolvedPacket::Blocked);
 		}
@@ -169,7 +218,7 @@ impl ClientStream {
 			return Ok(ResolvedPacket::Blocked);
 		}
 
-		if IpAddr::from_str(&packet.host).is_ok() {
+		if is_ip_literal(&packet.host) {
 			if !CONFIG.stream.allow_direct_ip {
 				return Ok(ResolvedPacket::Blocked);
 			}
@@ -199,7 +248,10 @@ impl ClientStream {
 			.context("failed to resolve hostname")?
 			.filter(|x| CONFIG.server.resolve_ipv6 || x.is_ipv4())
 			.map(|addr| {
-				if addr.is_loopback() && !CONFIG.stream.allow_loopback {
+				// check (and connect to) `::ffff:a.b.c.d` as plain IPv4 so it gets the IPv4 rules
+				let addr = addr.to_canonical();
+
+				if is_local_host(addr) && !CONFIG.stream.allow_loopback {
 					return ResolvedPacket::Blocked;
 				}
 
@@ -273,8 +325,11 @@ impl ClientStream {
 					.collect();
 				let pty = pty_process::Pty::new()?;
 
-				let cmd = pty_process::Command::new(&cmdline[0])
-					.args(&cmdline[1..])
+				let Some((program, args)) = cmdline.split_first() else {
+					return Ok(ClientStream::Invalid);
+				};
+				let cmd = pty_process::Command::new(program)
+					.args(args)
 					.spawn(&pty.pts()?)?;
 
 				Ok(ClientStream::Pty(cmd, pty))
@@ -290,18 +345,23 @@ pub enum WebSocketFrame {
 	Ignore,
 }
 
-pub struct WebSocketStreamWrapper(pub WebSocketStream<TokioIo<Upgraded>>);
+pub struct WebSocketStreamWrapper(pub WebSocketStream<TokioIo<Upgraded>>, pub PingLimiter);
 
 impl WebSocketStreamWrapper {
-	pub async fn read(&mut self) -> Option<Result<WebSocketFrame, tokio_websockets::Error>> {
+	pub fn new(ws: WebSocketStream<TokioIo<Upgraded>>) -> Self {
+		Self(ws, PingLimiter::default())
+	}
+
+	pub async fn read(&mut self) -> Option<anyhow::Result<WebSocketFrame>> {
 		let frame = self.0.next().await?;
 		match frame {
 			Ok(frame) if frame.is_binary() || frame.is_text() => {
 				Some(Ok(WebSocketFrame::Data(frame.into_payload().into())))
 			}
 			Ok(frame) if frame.is_close() => Some(Ok(WebSocketFrame::Close)),
+			Ok(frame) if frame.is_ping() && !self.1.record() => Some(Err(PingFlood.into())),
 			Ok(_) => Some(Ok(WebSocketFrame::Ignore)),
-			Err(err) => Some(Err(err)),
+			Err(err) => Some(Err(err.into())),
 		}
 	}
 
@@ -314,7 +374,60 @@ impl WebSocketStreamWrapper {
 		code: CloseCode,
 		reason: &str,
 	) -> Result<(), tokio_websockets::Error> {
-		self.0.send(Message::close(Some(code), reason)).await?;
+		// `Message::close` panics on reasons over 123 bytes (which aborts the process in release),
+		// and callers pass error strings we don't control
+		let mut end = reason.len().min(123);
+		while !reason.is_char_boundary(end) {
+			end -= 1;
+		}
+		self.0.send(Message::close(Some(code), &reason[..end])).await?;
 		self.0.close().await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn canon(s: &str) -> IpAddr {
+		IpAddr::from_str(s).unwrap().to_canonical()
+	}
+
+	#[test]
+	fn local_host_covers_unspecified_and_mapped_loopback() {
+		for s in ["127.0.0.1", "127.8.9.10", "0.0.0.0", "::1", "::", "::ffff:127.0.0.1", "::ffff:0.0.0.0"] {
+			assert!(is_local_host(canon(s)), "{s}");
+		}
+		for s in ["1.1.1.1", "10.0.0.1", "::ffff:1.1.1.1", "2606:4700::1111"] {
+			assert!(!is_local_host(canon(s)), "{s}");
+		}
+	}
+
+	#[test]
+	fn link_local_v6_is_not_global() {
+		assert!(!is_global(canon("fe80::1")));
+		assert!(!is_global(canon("febf::1")));
+		assert!(!is_global(canon("fd00::1")));
+		assert!(is_global(canon("2606:4700::1111")));
+		// mapped addresses get the IPv4 rules once canonicalized
+		assert!(!is_global(canon("::ffff:192.168.1.1")));
+		assert!(is_global(canon("::ffff:1.1.1.1")));
+	}
+
+	#[test]
+	fn ip_literal_forms() {
+		for s in ["127.0.0.1", "::1", "[::1]", "2130706433", "0x7f.1", "127.1", "0x7f000001"] {
+			assert!(is_ip_literal(s), "{s}");
+		}
+		for s in ["example.com", "deadbeef", "1.example", "0x.1", "1..2", "a.b.c.d.e"] {
+			assert!(!is_ip_literal(s), "{s}");
+		}
+	}
+
+	#[test]
+	fn host_normalization() {
+		assert_eq!(normalize_host("EXAMPLE.Com."), "example.com");
+		assert_eq!(normalize_host("example.com"), "example.com");
+		assert_eq!(normalize_host("127.0.0.1"), "127.0.0.1");
 	}
 }

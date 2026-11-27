@@ -32,6 +32,8 @@ pub mod config;
 #[doc(hidden)]
 mod handle;
 #[doc(hidden)]
+mod limits;
+#[doc(hidden)]
 mod listener;
 #[doc(hidden)]
 mod route;
@@ -45,6 +47,8 @@ mod upgrade;
 mod util_chain;
 #[doc(hidden)]
 mod util_map_err;
+#[doc(hidden)]
+mod ws_limit;
 
 #[doc(hidden)]
 type Client = (Mutex<HashMap<Uuid, (ConnectPacket, ConnectPacket)>>, String);
@@ -155,13 +159,26 @@ async fn async_init() {
 
 	validate_config_cache().await;
 
+	if CONFIG.wisp.allow_wsproxy && CONFIG.wisp.auth_extension.is_some() {
+		warn!("allow_wsproxy is ignored because a Wisp auth extension is configured (wsproxy cannot authenticate)");
+	}
+	if matches!(CONFIG.server.stats_endpoint, Some(StatsEndpoint::SameServer(_)))
+		&& !CONFIG.server.stats_hide_clients
+	{
+		warn!("stats are served on the main listener without authentication and include every client's address and destinations; consider a separate private bind address or stats_hide_clients = true");
+	}
+	if CONFIG.wisp.has_wispnet() && CONFIG.wisp.auth_extension.is_some() {
+		warn!("wispnet server registration (?net) is disabled because a Wisp auth extension is configured (wispnet peers cannot authenticate)");
+	}
+
 	info!(
 		"listening on {:?} with runtime flavor {:?} and socket transport {:?}",
 		CONFIG.server.bind, CONFIG.server.runtime, CONFIG.server.transport
 	);
 
 	trace!("CLI: {:#?}", &*CLI);
-	trace!("CONFIG: {:#?}", &*CONFIG);
+	// serialized rather than `Debug` so passwords are redacted
+	trace!("CONFIG: {}", CONFIG.ser().unwrap_or_default());
 	trace!("RESOLVER: {:?}", &*RESOLVER);
 }
 
@@ -270,12 +287,16 @@ async fn listen_stats(bind_addr: BindAddr) -> Result<()> {
 		match stats_listener.accept().await {
 			Ok((stream, _)) => {
 				tokio::spawn(async move {
-					if let Err(e) = Box::pin(route_stats(stream)).await {
+					let res = async { Box::pin(route_stats(stream.finish().await?)).await }.await;
+					if let Err(e) = res {
 						error!("error while routing stats client: {:?}", e);
 					}
 				});
 			}
-			Err(e) => error!("error while accepting stats client: {:?}", e),
+			Err(e) => {
+				error!("error while accepting stats client: {:?}", e);
+				accept_error_backoff().await;
+			}
 		}
 	}
 }
@@ -297,6 +318,13 @@ async fn listen_wisp() -> Result<()> {
 		match listener.accept().await {
 			Ok((stream, client_id)) => {
 				tokio::spawn(async move {
+					let stream = match stream.finish().await {
+						Ok(stream) => stream,
+						Err(e) => {
+							debug!("error while finishing client connection: {:?}", e);
+							return;
+						}
+					};
 					let res = Box::pin(route::route(
 						stream,
 						stats_endpoint,
@@ -318,9 +346,19 @@ async fn listen_wisp() -> Result<()> {
 					}
 				});
 			}
-			Err(e) => error!("error while accepting client: {:?}", e),
+			Err(e) => {
+				error!("error while accepting client: {:?}", e);
+				accept_error_backoff().await;
+			}
 		}
 	}
+}
+
+/// Pause after a failed accept. Errors like EMFILE return immediately every time, so without
+/// this the accept loop spins at 100% CPU and floods the log until descriptors free up.
+#[doc(hidden)]
+async fn accept_error_backoff() {
+	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
 #[doc(hidden)]

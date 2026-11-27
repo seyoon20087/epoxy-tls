@@ -8,13 +8,11 @@ use hyper::{
 	body::Incoming, header::SEC_WEBSOCKET_PROTOCOL, server::conn::http1::Builder,
 	service::service_fn, upgrade::OnUpgrade, HeaderMap, Request, Response, StatusCode,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use log::{debug, error, trace};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tokio_websockets::Limits;
-use wisp_mux::ws::{
-	TokioWebsocketsTransport, TransportExt, WebSocketSplitRead, WebSocketSplitWrite,
-};
+use wisp_mux::ws::{TransportExt, WebSocketSplitRead, WebSocketSplitWrite};
 
 use crate::{
 	config::SocketTransport,
@@ -24,15 +22,16 @@ use crate::{
 	upgrade::{is_upgrade_request, upgrade},
 	util_chain::{chain, Chain},
 	util_map_err::MapErr,
+	ws_limit::LimitedWsTransport,
 	CONFIG,
 };
 
 pub type WispStreamRead = Either<
-	WebSocketSplitRead<TokioWebsocketsTransport<Chain<Cursor<Bytes>, ServerStream>>>,
+	WebSocketSplitRead<LimitedWsTransport<Chain<Cursor<Bytes>, ServerStream>>>,
 	MapErr<FramedRead<ServerStreamRead, LengthDelimitedCodec>>,
 >;
 pub type WispWsStreamWrite =
-	WebSocketSplitWrite<TokioWebsocketsTransport<Chain<Cursor<Bytes>, ServerStream>>>;
+	WebSocketSplitWrite<LimitedWsTransport<Chain<Cursor<Bytes>, ServerStream>>>;
 pub type WispStreamWrite =
 	Either<WispWsStreamWrite, MapErr<FramedWrite<ServerStreamWrite, LengthDelimitedCodec>>>;
 pub type WispResult = (WispStreamRead, WispStreamWrite);
@@ -128,6 +127,20 @@ where
 
 	trace!("recieved request {:?}", req);
 
+	if !CONFIG.server.allowed_origins.is_empty() {
+		if let Some(origin) = req.headers().get(hyper::header::ORIGIN) {
+			let allowed = origin
+				.to_str()
+				.is_ok_and(|o| CONFIG.server.allowed_origins.iter().any(|x| x == o));
+			if !allowed {
+				debug!("rejected websocket upgrade from disallowed origin {:?}", origin);
+				return Ok(Response::builder()
+					.status(StatusCode::FORBIDDEN)
+					.body(Body::new(Bytes::new()))?);
+			}
+		}
+	}
+
 	let (resp, fut) = upgrade(&mut req)?;
 	// replace body of Empty<Bytes> with Full<Bytes>
 	let mut resp = Response::from_parts(resp.into_parts().0, Body::new(Bytes::new()));
@@ -144,8 +157,12 @@ where
 
 	if req_path.ends_with(&(CONFIG.wisp.prefix.clone() + "/")) {
 		let has_ws_protocol = ws_protocol.is_some();
-		let is_wispnet =
-			CONFIG.wisp.has_wispnet() && req.uri().query().unwrap_or_default() == "net";
+		// Wispnet peers act as the Wisp *server*, so Wisp auth can't authenticate them. When auth
+		// is configured, don't let unauthenticated peers register (they'd fall through to a
+		// normal, authenticated Wisp connection instead).
+		let is_wispnet = CONFIG.wisp.has_wispnet()
+			&& CONFIG.wisp.auth_extension.is_none()
+			&& req.uri().query().unwrap_or_default() == "net";
 		tokio::spawn(async move {
 			if let Err(err) = (callback)(
 				fut,
@@ -164,7 +181,9 @@ where
 			resp.headers_mut()
 				.append(SEC_WEBSOCKET_PROTOCOL, protocol.clone());
 		}
-	} else if CONFIG.wisp.allow_wsproxy {
+	} else if CONFIG.wisp.allow_wsproxy && CONFIG.wisp.auth_extension.is_none() {
+		// wsproxy has no way to authenticate, so it must not be reachable when Wisp auth is on
+		// or it becomes an unauthenticated proxy next to the authenticated one
 		let udp = req.uri().query().unwrap_or_default() == "udp";
 		tokio::spawn(async move {
 			if let Err(err) = (callback)(
@@ -191,6 +210,7 @@ where
 pub async fn route_stats(stream: ServerStream) -> anyhow::Result<()> {
 	let stream = TokioIo::new(stream);
 	Builder::new()
+		.timer(TokioTimer::new())
 		.serve_connection(stream, service_fn(move |_| async { send_stats().await }))
 		.await?;
 	Ok(())
@@ -205,7 +225,10 @@ pub async fn route(
 		SocketTransport::WebSocket => {
 			let stream = TokioIo::new(stream);
 
+			// the timer enables hyper's default 30s header read timeout, which is silently
+			// disabled without one
 			Builder::new()
+				.timer(TokioTimer::new())
 				.serve_connection(
 					stream,
 					service_fn(move |req| {
@@ -232,7 +255,7 @@ pub async fn route(
 											)))
 											.serve(ws);
 										let (read, write) =
-											TokioWebsocketsTransport(ws).split_fast();
+											LimitedWsTransport::new(ws).split_fast();
 
 										let result = if is_wispnet {
 											ServerRouteResult::Wispnet {
@@ -253,7 +276,7 @@ pub async fn route(
 												CONFIG.server.max_message_size,
 											)))
 											.serve(TokioIo::new(ws));
-										let ws = WebSocketStreamWrapper(ws);
+										let ws = WebSocketStreamWrapper::new(ws);
 										(callback)(
 											ServerRouteResult::WsProxy {
 												stream: ws,
@@ -276,7 +299,7 @@ pub async fn route(
 		SocketTransport::LengthDelimitedLe => {
 			let codec = LengthDelimitedCodec::builder()
 				.little_endian()
-				.max_frame_length(usize::MAX)
+				.max_frame_length(CONFIG.server.max_message_size)
 				.new_codec();
 
 			let (read, write) = stream.split();

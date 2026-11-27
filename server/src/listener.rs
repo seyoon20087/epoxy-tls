@@ -6,6 +6,7 @@ use std::{
 	pin::Pin,
 	str::FromStr,
 	sync::Arc,
+	time::Duration,
 };
 
 use anyhow::Context;
@@ -14,6 +15,7 @@ use tokio::{
 	fs::{remove_file, try_exists, File},
 	io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadHalf, WriteHalf},
 	net::{tcp, unix, TcpListener, TcpSocket, TcpStream, UnixListener, UnixStream},
+	time::timeout,
 };
 use tokio_rustls::{rustls, server::TlsStream, TlsAcceptor};
 use uuid::Uuid;
@@ -278,6 +280,37 @@ impl ServerStreamExt for ServerStream {
 	}
 }
 
+/// How long a client gets to finish the TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An accepted connection whose TLS handshake (if any) has not been done yet.
+///
+/// The handshake is done by [`PendingStream::finish`] in the per-connection task, so a client
+/// that never sends a ClientHello can't stall the accept loop for everyone else.
+pub enum PendingStream {
+	Ready(ServerStream),
+	TlsTcp(TcpStream, TlsAcceptor),
+	TlsUnix(UnixStream, TlsAcceptor),
+}
+
+impl PendingStream {
+	pub async fn finish(self) -> anyhow::Result<ServerStream> {
+		match self {
+			Self::Ready(x) => Ok(x),
+			Self::TlsTcp(x, tls) => Ok(Quintet::Two(
+				timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(x))
+					.await
+					.context("tls handshake timed out")??,
+			)),
+			Self::TlsUnix(x, tls) => Ok(Quintet::Four(
+				timeout(TLS_HANDSHAKE_TIMEOUT, tls.accept(x))
+					.await
+					.context("tls handshake timed out")??,
+			)),
+		}
+	}
+}
+
 pub enum ServerListener {
 	Tcp(TcpListener),
 	TlsTcp(TcpListener, TlsAcceptor),
@@ -308,8 +341,15 @@ impl ServerListener {
 		if try_exists(&bind.1).await? {
 			remove_file(&bind.1).await?;
 		}
-		UnixListener::bind(&bind.1)
-			.with_context(|| format!("failed to bind to unix socket at `{}`", bind.1))
+		let listener = UnixListener::bind(&bind.1)
+			.with_context(|| format!("failed to bind to unix socket at `{}`", bind.1))?;
+		if let Some(mode) = CONFIG.server.unix_socket_permissions {
+			use std::os::unix::fs::PermissionsExt;
+			tokio::fs::set_permissions(&bind.1, std::fs::Permissions::from_mode(mode))
+				.await
+				.with_context(|| format!("failed to set permissions on unix socket `{}`", bind.1))?;
+		}
+		Ok(listener)
 	}
 
 	async fn create_tls() -> anyhow::Result<TlsAcceptor> {
@@ -388,25 +428,23 @@ impl ServerListener {
 		))
 	}
 
-	pub async fn accept(&mut self) -> anyhow::Result<(ServerStream, String)> {
+	pub async fn accept(&mut self) -> anyhow::Result<(PendingStream, String)> {
 		match self {
 			Self::Tcp(x) => {
 				let (x, y) = Self::accept_tcp(x).await?;
-				Ok((Quintet::One(x), y))
+				Ok((PendingStream::Ready(Quintet::One(x)), y))
 			}
 			Self::TlsTcp(tcp, tls) => {
 				let (x, y) = Self::accept_tcp(tcp).await?;
-				let x = tls.accept(x).await?;
-				Ok((Quintet::Two(x), y))
+				Ok((PendingStream::TlsTcp(x, tls.clone()), y))
 			}
 			Self::Unix(x) => {
 				let (x, y) = Self::accept_unix(x).await?;
-				Ok((Quintet::Three(x), y))
+				Ok((PendingStream::Ready(Quintet::Three(x)), y))
 			}
 			Self::TlsUnix(unix, tls) => {
 				let (x, y) = Self::accept_unix(unix).await?;
-				let x = tls.accept(x).await?;
-				Ok((Quintet::Four(x), y))
+				Ok((PendingStream::TlsUnix(x, tls.clone()), y))
 			}
 			Self::File(path) => {
 				if let Some(path) = path.take() {
@@ -451,7 +489,7 @@ impl ServerListener {
 					}
 
 					Ok((
-						Quintet::Five(Duplex::new(rx, tx)),
+						PendingStream::Ready(Quintet::Five(Duplex::new(rx, tx))),
 						path.to_string_lossy().to_string(),
 					))
 				} else {
