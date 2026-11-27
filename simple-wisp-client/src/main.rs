@@ -239,7 +239,7 @@ async fn real_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             stdout().flush().unwrap();
             avg.add_sample(now - last_time);
 
-			let _ = top_avg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+			let _ = top_avg.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
 				(old < now - last_time).then(|| now - last_time)
 			});
 
