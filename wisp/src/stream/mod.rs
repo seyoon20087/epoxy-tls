@@ -13,6 +13,23 @@ use crate::{
 	LockedWebSocketWrite, WispError,
 };
 
+/// Like `ready!` for a poll of the shared transport while holding its lock: on `Pending`,
+/// release the lock but stay queued for it (see `LockedSink::unlock_and_wait`). Holding the
+/// lock across `Pending` deadlocks every other stream if the caller never polls us again,
+/// which futures-rustls does after writing its ClientHello.
+macro_rules! ready_or_wait {
+	($lock:expr, $cx:expr, $x:expr) => {{
+		let polled = $x;
+		match polled {
+			Poll::Ready(x) => x,
+			Poll::Pending => {
+				$lock.unlock_and_wait($cx);
+				return Poll::Pending;
+			}
+		}
+	}};
+}
+
 mod compat;
 mod handles;
 pub use compat::*;
@@ -110,7 +127,13 @@ impl<W: TransportWrite> Stream for MuxStreamRead<W> {
 
 			if self.read_cnt > self.info.target_flow_control {
 				ready!(self.write.poll_lock(cx));
-				unlock_some!(self.write, ready!(self.write.get().poll_ready(cx)));
+				// not `ready_or_wait!`: `chunk` has to be stashed for the retry
+				let Poll::Ready(readied) = self.write.get().poll_ready(cx) else {
+					self.write.unlock_and_wait(cx);
+					self.chunk = Some(chunk);
+					return Poll::Pending;
+				};
+				unlock_some!(self.write, readied);
 				let pkt =
 					Packet::new_continue(self.info.id, self.info.flow_add(self.read_cnt)).encode();
 				unlock_some!(self.write, self.write.get().start_send(pkt));
@@ -226,7 +249,10 @@ impl<W: TransportWrite> Sink<Payload> for MuxStreamWrite<W> {
 
 		if self.chunk.is_some() {
 			ready!(self.write.poll_lock(cx));
-			unlock!(self.write, ready!(self.write.get().poll_ready(cx)));
+			unlock!(
+				self.write,
+				ready_or_wait!(self.write, cx, self.write.get().poll_ready(cx))
+			);
 			unlock!(self.write, self.maybe_write());
 			self.write.unlock();
 		}
@@ -245,10 +271,16 @@ impl<W: TransportWrite> Sink<Payload> for MuxStreamWrite<W> {
 		ready!(self.write.poll_lock(cx));
 
 		if self.chunk.is_some() {
-			unlock!(self.write, ready!(self.write.get().poll_ready(cx)));
+			unlock!(
+				self.write,
+				ready_or_wait!(self.write, cx, self.write.get().poll_ready(cx))
+			);
 			unlock!(self.write, self.maybe_write());
 		}
-		unlock!(self.write, ready!(self.write.get().poll_flush(cx)));
+		unlock!(
+			self.write,
+			ready_or_wait!(self.write, cx, self.write.get().poll_flush(cx))
+		);
 
 		self.write.unlock();
 		Poll::Ready(Ok(()))

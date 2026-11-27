@@ -121,23 +121,27 @@ impl<W: TransportWrite> AsyncWrite for MuxStreamAsyncWrite<W> {
 		buf: &[u8],
 	) -> Poll<io::Result<usize>> {
 		ready!(self.write.poll_lock(cx));
-		ready!(self.write.get().poll_ready(cx)).map_err(io::Error::other)?;
 
-		let packet = Packet::new_data(self.info.id, buf);
-		self.write
-			.get()
-			.start_send(packet.encode())
-			.map_err(io::Error::other)?;
+		// drive any in-flight write first: the sink may track only one pending write, and
+		// `start_send` would replace it along with whatever waker was parked on it
+		let mut sent = ready_or_wait!(self.write, cx, self.write.get().poll_flush(cx));
+		if sent.is_ok() {
+			sent = ready_or_wait!(self.write, cx, self.write.get().poll_ready(cx));
+		}
+		if sent.is_ok() {
+			let packet = Packet::new_data(self.info.id, buf);
+			sent = self.write.get().start_send(packet.encode());
+		}
 
 		self.write.unlock();
-		Poll::Ready(Ok(buf.len()))
+		Poll::Ready(sent.map(|()| buf.len()).map_err(io::Error::other))
 	}
 
 	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		ready!(self.write.poll_lock(cx));
-		ready!(self.write.get().poll_flush(cx)).map_err(io::Error::other)?;
+		let flushed = ready_or_wait!(self.write, cx, self.write.get().poll_flush(cx));
 		self.write.unlock();
-		Poll::Ready(Ok(()))
+		Poll::Ready(flushed.map_err(io::Error::other))
 	}
 
 	fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
