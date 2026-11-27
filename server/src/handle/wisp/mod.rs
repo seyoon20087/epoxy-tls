@@ -371,6 +371,8 @@ pub async fn handle_wisp(stream: WispResult, is_v2: bool, id: String) -> anyhow:
 	});
 
 	while let Some((connect, stream)) = mux.wait_for_stream().await {
+		// reap finished streams so long-lived clients don't grow memory forever
+		while set.try_join_next().is_some() {}
 		set.spawn(handle_stream(
 			connect,
 			stream,
